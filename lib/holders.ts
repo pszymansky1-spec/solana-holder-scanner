@@ -1,94 +1,72 @@
 import { getCache, setCache } from './cache';
 
-const DELAY_MS = 500;
+const DELAY_MS = 300;
 
 function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 interface HolderResult {
-  address: string;
+  address: string;  // token account address
+  owner: string;    // owner wallet address
   balance: number;
 }
 
-/** Try multiple RPC endpoints in order */
-const RPCS = [
-  (key: string) => `https://mainnet.helius-rpc.com/?api-key=${key}`,
-  () => 'https://api.mainnet-beta.solana.com',
-  () => 'https://solana-mainnet.g.alchemy.com/v2/demo',
-  () => 'https://rpc.ankr.com/solana',
-];
-
-async function rpcCall(method: string, params: any[], apiKey: string): Promise<any> {
-  for (const rpcFn of RPCS) {
-    const url = rpcFn(apiKey);
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: '1', method, params }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) continue;
-      const json = await res.json();
-      if (json.error) continue;
-      return json.result;
-    } catch {
-      continue;
-    }
-  }
-  return null;
+async function fetchFromHelius(method: string, params: any[], apiKey: string): Promise<any> {
+  const url = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: '1', method, params }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) return null;
+  const json = await res.json();
+  return json.error ? null : json.result;
 }
 
-async function fetchHoldersViaGetTokenLargestAccounts(
-  mint: string,
-  apiKey: string
-): Promise<HolderResult[]> {
-  const result = await rpcCall('getTokenLargestAccounts', [mint], apiKey);
-  if (!result?.value) return [];
+async function fetchTopHolders(mint: string, apiKey: string): Promise<HolderResult[]> {
+  const cacheKey = `holders:${mint}`;
+  const cached = getCache<HolderResult[]>(cacheKey);
+  if (cached) return cached;
 
-  const owners: HolderResult[] = [];
-  for (const acct of result.value) {
-    // Get the owner of this token account
-    const acctInfo = await rpcCall(
-      'getAccountInfo',
-      [acct.address, { encoding: 'jsonParsed' }],
-      apiKey
-    );
-    const owner = acctInfo?.value?.data?.parsed?.info?.owner;
-    if (owner) {
-      owners.push({ address: owner, balance: parseFloat(acct.uiAmount ?? '0') });
-    }
+  await delay(DELAY_MS);
+
+  // getTokenLargestAccounts returns top token accounts (fast ~1s)
+  const result = await fetchFromHelius('getTokenLargestAccounts', [mint], apiKey);
+  if (!result?.value || result.value.length === 0) {
+    setCache(cacheKey, []);
+    return [];
   }
-  return owners;
-}
 
-async function fetchHoldersViaGetProgramAccounts(
-  mint: string,
-  apiKey: string
-): Promise<HolderResult[]> {
-  const result = await rpcCall('getProgramAccounts', [
-    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-    {
-      encoding: 'jsonParsed',
-      filters: [
-        { dataSize: 165 },
-        { memcmp: { offset: 0, bytes: mint } },
-      ],
-    },
-  ], apiKey);
-
-  if (!result || !Array.isArray(result)) return [];
-
+  // Fetch owner for each token account in parallel
   const holders: HolderResult[] = [];
-  for (const acct of result) {
-    const info = acct.account?.data?.parsed?.info;
-    if (!info) continue;
-    const amount = parseFloat(info.tokenAmount?.uiAmount ?? '0');
-    if (amount > 0) {
-      holders.push({ address: info.owner, balance: amount });
-    }
+  const batches = [];
+  for (let i = 0; i < result.value.length; i += 5) {
+    batches.push(result.value.slice(i, i + 5));
   }
+
+  for (const batch of batches) {
+    const ownerResults = await Promise.all(
+      batch.map(async (acct: any) => {
+        const acctInfo = await fetchFromHelius('getAccountInfo', [
+          acct.address,
+          { encoding: 'jsonParsed' },
+        ], apiKey);
+        const owner = acctInfo?.value?.data?.parsed?.info?.owner;
+        if (owner) {
+          return { address: acct.address, owner, balance: parseFloat(acct.uiAmount ?? '0') };
+        }
+        return null;
+      })
+    );
+    for (const h of ownerResults) {
+      if (h) holders.push(h);
+    }
+    if (batches.length > 1) await delay(200);
+  }
+
+  setCache(cacheKey, holders);
   return holders;
 }
 
@@ -104,29 +82,6 @@ export interface ScanResult {
   totalHolders: number;
 }
 
-async function fetchHoldersForToken(
-  mint: string,
-  heliusKey: string
-): Promise<HolderResult[]> {
-  const cacheKey = `holders:${mint}`;
-  const cached = getCache<HolderResult[]>(cacheKey);
-  if (cached) return cached;
-
-  await delay(DELAY_MS);
-
-  // Try getTokenLargestAccounts first (works on most RPCs)
-  let holders = await fetchHoldersViaGetTokenLargestAccounts(mint, heliusKey);
-
-  // Fallback to getProgramAccounts
-  if (holders.length === 0) {
-    await delay(DELAY_MS);
-    holders = await fetchHoldersViaGetProgramAccounts(mint, heliusKey);
-  }
-
-  setCache(cacheKey, holders);
-  return holders;
-}
-
 export async function scanOverlap(
   tokens: { mint: string; symbol: string }[],
   heliusKey: string
@@ -134,7 +89,7 @@ export async function scanOverlap(
   const allHolders: Map<string, HolderResult[]> = new Map();
 
   for (const token of tokens) {
-    const holders = await fetchHoldersForToken(token.mint, heliusKey);
+    const holders = await fetchTopHolders(token.mint, heliusKey);
     allHolders.set(token.mint, holders);
   }
 
@@ -144,9 +99,9 @@ export async function scanOverlap(
   for (const token of tokens) {
     const holders = allHolders.get(token.mint) ?? [];
     for (const h of holders) {
-      const entry = walletMap.get(h.address) ?? [];
+      const entry = walletMap.get(h.owner) ?? [];
       entry.push({ mint: token.mint, symbol: token.symbol, balance: h.balance });
-      walletMap.set(h.address, entry);
+      walletMap.set(h.owner, entry);
     }
   }
 
@@ -154,11 +109,7 @@ export async function scanOverlap(
   const overlapping: WalletOverlap[] = [];
   for (const [wallet, heldTokens] of walletMap) {
     if (heldTokens.length >= 2) {
-      overlapping.push({
-        wallet,
-        tokens: heldTokens,
-        count: heldTokens.length,
-      });
+      overlapping.push({ wallet, tokens: heldTokens, count: heldTokens.length });
     }
   }
 
@@ -167,7 +118,7 @@ export async function scanOverlap(
   const totalHolders = new Set<string>();
   for (const holders of allHolders.values()) {
     for (const h of holders) {
-      totalHolders.add(h.address);
+      totalHolders.add(h.owner);
     }
   }
 

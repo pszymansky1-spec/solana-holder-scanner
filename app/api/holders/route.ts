@@ -2,6 +2,8 @@ import { type NextRequest } from 'next/server';
 import { scanOverlap } from '@/lib/holders';
 import { getTokenInfo } from '@/lib/tokens';
 
+export const maxDuration = 30;
+
 export async function POST(request: NextRequest) {
   try {
     const { tokens } = await request.json();
